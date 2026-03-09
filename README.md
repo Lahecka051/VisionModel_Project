@@ -1,3 +1,5 @@
+# Video-Integrated Vision for Intelligent Detection of Small Objects (VIVID) Project
+
 # **Used_Datasets**
 ## **AI-HUB**
 ### 군 경계 작전 환경 내 인식 데이터
