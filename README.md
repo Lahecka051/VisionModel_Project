@@ -1,4 +1,4 @@
-# Video-Integrated Vision for Intelligent Detection of Small Objects (VIVID) Project
+# Video-Integrated Vision for Intelligent Detection of Small Objects on RF-DETR (VIVID-DETR) Project
 
 # **Used_Datasets**
 ## **AI-HUB**
