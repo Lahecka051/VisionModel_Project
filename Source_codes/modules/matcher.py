@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-# Modified for VIVID-Det: SAWM (Scale-Aware Wasserstein Matching)
+# Modified for SOD: NWD (Normalized Wasserstein Distance) matching
 # NWD cost added to Hungarian matching. cost_nwd=0 preserves original behavior.
 # ------------------------------------------------------------------------
 # Copied and modified from LW-DETR (https://github.com/Atten4Vis/LW-DETR)
@@ -30,7 +30,7 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 
 from rfdetr.models.segmentation_head import point_sample
-from rfdetr.models.nwd_matching import nwd_pairwise
+from rfdetr.models.nwd import nwd_pairwise
 from rfdetr.util.box_ops import batch_dice_loss, batch_sigmoid_ce_loss, box_cxcywh_to_xyxy, generalized_box_iou
 
 
@@ -60,8 +60,8 @@ class HungarianMatcher(nn.Module):
             cost_class: This is the relative weight of the classification error in the matching cost
             cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
             cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
-            cost_nwd: This is the relative weight of the NWD cost in the matching cost (SAWM). 0 disables.
-            nwd_C: NWD normalization constant. ~0.5 for COCO-scale normalized coords.
+            cost_nwd: This is the relative weight of the NWD cost in the matching cost. 0 disables.
+            nwd_C: NWD normalization constant. 0.5 for normalized coords (논문 기준).
         """
         super().__init__()
         self.cost_class = cost_class
@@ -124,7 +124,7 @@ class HungarianMatcher(nn.Module):
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
-        # [SAWM] Compute the NWD cost between boxes
+        # [NWD] Compute the NWD cost between boxes
         if self.cost_nwd > 0:
             nwd = nwd_pairwise(out_bbox, tgt_bbox, C=self.nwd_C)
             cost_nwd_val = 1 - nwd
@@ -167,7 +167,7 @@ class HungarianMatcher(nn.Module):
             cost_mask_ce = batch_sigmoid_ce_loss(pred_masks_logits, tgt_masks_flat)
             cost_mask_dice = batch_dice_loss(pred_masks_logits, tgt_masks_flat)
 
-        # Final cost matrix [SAWM: + cost_nwd term]
+        # Final cost matrix [NWD: + cost_nwd term, 논문 식 (11)]
         C = (self.cost_bbox * cost_bbox
              + self.cost_class * cost_class
              + self.cost_giou * cost_giou

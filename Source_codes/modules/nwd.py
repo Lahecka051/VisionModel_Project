@@ -1,9 +1,8 @@
 # ------------------------------------------------------------------------
-# VIVID-Det
-# Copyright (c) 2026. All Rights Reserved.
+# SOD: Small Object Detection
 # ------------------------------------------------------------------------
-# SAWM: Scale-Aware Wasserstein Matching
-# NWD (Normalized Wasserstein Distance) for Hungarian matching cost.
+# NWD: Normalized Wasserstein Distance
+# bbox를 2D Gaussian으로 모델링하여 Hungarian matching cost에 적용.
 # Reference: J. Wang et al., "A Normalized Gaussian Wasserstein Distance
 #            for Tiny Object Detection," CVPR, 2022.
 # ------------------------------------------------------------------------
@@ -12,6 +11,7 @@
 NWD: bbox를 2D Gaussian N(cx, cy, w/2, h/2)으로 모델링하여
 Wasserstein-2 거리를 계산하고, exp(-W2/C)로 정규화한다.
 
+논문 식 (9), (10):
 소형 객체(16x16)에서 1px 오차: IoU ~0.68, NWD ~0.95
 → matching 단계에서 소형 객체에 안정적인 cost를 제공한다.
 """
@@ -20,7 +20,7 @@ import torch
 
 
 def box_to_gaussian(boxes):
-    """cxcywh 박스를 2D Gaussian 파라미터로 변환.
+    """cxcywh 박스를 2D Gaussian 파라미터로 변환. 논문 식 (7), (8).
 
     Args:
         boxes: (N, 4) tensor [cx, cy, w, h], 정규화 좌표 [0, 1]
@@ -35,7 +35,7 @@ def box_to_gaussian(boxes):
 
 
 def wasserstein2_pairwise(mu1, sigma1, mu2, sigma2):
-    """두 Gaussian 집합 간 pairwise Wasserstein-2 거리의 제곱.
+    """두 Gaussian 집합 간 pairwise Wasserstein-2 거리의 제곱. 논문 식 (9).
 
     W2^2 = ||mu1 - mu2||^2 + ||sigma1 - sigma2||^2
 
@@ -58,7 +58,7 @@ def wasserstein2_pairwise(mu1, sigma1, mu2, sigma2):
 
 
 def nwd_pairwise(pred_boxes, tgt_boxes, C=0.5):
-    """Pairwise NWD (Normalized Wasserstein Distance).
+    """Pairwise NWD (Normalized Wasserstein Distance). 논문 식 (10).
 
     NWD = exp(-sqrt(W2^2) / C)
 
@@ -67,8 +67,7 @@ def nwd_pairwise(pred_boxes, tgt_boxes, C=0.5):
     Args:
         pred_boxes: (N, 4) [cx, cy, w, h] 정규화 좌표
         tgt_boxes: (M, 4) [cx, cy, w, h] 정규화 좌표
-        C: 정규화 상수. 데이터셋 객체 크기 분포에 의존.
-           COCO small 기준 ~0.5 권장. 군경계 데이터셋에서 조정 가능.
+        C: 정규화 상수. 0.5 (논문 기준).
 
     Returns:
         nwd: (N, M) pairwise NWD 값

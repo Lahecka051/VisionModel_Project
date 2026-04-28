@@ -1,16 +1,15 @@
 """
 SCA: Selective Cross-Attention
 
-SOD-DETR SCA 모듈. Backbone→Projector 간극에 삽입.
-CNN Branch 고해상도 특징 + ViT Attention Prior → SOPM → Top-K 선택적 Cross-Attention.
+SOD 모듈. Backbone→Projector 간극에 삽입.
+CNN Branch 고해상도 특징 + ViT Attention Prior → Small Object Heatmap → Top-K 선택적 Cross-Attention.
 
-@changelog
-[v1.0.0] 2026-03-10 - 초기 구현. SOD-DETR 기반.
+논문: "선택적 특징 융합을 적용한 트랜스포머 기반 소형 객체 탐지"
   - CNNBranch: stride-8, GroupNorm(32), 256ch
   - AttentionPriorExtractor: DINOv2 Block4 Self-Attn hook
-  - SOPMHead: concat(D3, attn_prior) → Sigmoid
+  - SmallObjectHeatmapHead: concat(D3, attn_prior) → Sigmoid
   - SelectiveCrossAttention: Top-K 25%, 2D sinusoidal PE
-  - SOPMFocalLoss: GT small heatmap 직접 감독
+  - HeatmapFocalLoss: GT small heatmap 직접 감독
   - SCA: 통합 모듈, alpha=0.01 초기화
 """
 
@@ -86,7 +85,7 @@ class AttentionPriorExtractor:
     def __init__(self) -> None:
         self._q_output: Optional[torch.Tensor] = None
         self._k_output: Optional[torch.Tensor] = None
-        self._num_heads: int = 6  # ViT-S/14
+        self._num_heads: int = 6  # ViT-S/16 기준
         self._handles: List = []
 
     def register(self, attn_module: nn.Module, num_heads: int = 6) -> None:
@@ -218,11 +217,13 @@ class CNNBranch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SOPM Head (Small Object Possibility Map)
+# Small Object Heatmap Head (소형 객체 히트맵)
 # ---------------------------------------------------------------------------
 
-class SOPMHead(nn.Module):
-    """SOPM 생성: concat(D3_reduced, Attn_prior) → Conv1x1 → Sigmoid.
+class SmallObjectHeatmapHead(nn.Module):
+    """소형 객체 히트맵 S 생성: concat(D3_reduced, Attn_prior) → Conv1x1 → Sigmoid.
+
+    논문 식 (1): S = σ(Conv1×1([F_cnn; A]))
 
     D3 (256ch) → 1x1 Conv → 1ch activation.
     Attn Prior (1ch, 선택적) 와 concat 후 최종 1ch Sigmoid.
@@ -232,7 +233,7 @@ class SOPMHead(nn.Module):
         super().__init__()
         # D3 256ch → 1ch 차원 축소
         self.d3_reduce = nn.Conv2d(cnn_channels, 1, kernel_size=1, bias=True)
-        # concat(d3_1ch, attn_prior_1ch) = 2ch → 1ch SOPM
+        # concat(d3_1ch, attn_prior_1ch) = 2ch → 1ch heatmap
         self.fuse = nn.Conv2d(2, 1, kernel_size=1, bias=True)
 
     def forward(
@@ -244,20 +245,20 @@ class SOPMHead(nn.Module):
         Args:
             d3: CNN 특징맵 [B, 256, H_d3, W_d3].
             attn_prior: ViT attention prior [B, 1, H_d3, W_d3].
-                        None이면 D3만으로 SOPM 생성 (ablation C1).
+                        None이면 D3만으로 히트맵 생성.
 
         Returns:
-            SOPM [B, 1, H_d3, W_d3], 값 범위 (0, 1).
+            소형 객체 히트맵 S [B, 1, H_d3, W_d3], 값 범위 (0, 1).
         """
         d3_act = self.d3_reduce(d3)  # [B, 1, H, W]
 
         if attn_prior is not None:
             fused = torch.cat([d3_act, attn_prior], dim=1)  # [B, 2, H, W]
-            sopm = torch.sigmoid(self.fuse(fused))
+            heatmap = torch.sigmoid(self.fuse(fused))
         else:
-            sopm = torch.sigmoid(d3_act)
+            heatmap = torch.sigmoid(d3_act)
 
-        return sopm
+        return heatmap
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +268,9 @@ class SOPMHead(nn.Module):
 class SelectiveCrossAttention(nn.Module):
     """Top-K 선택적 Cross-Attention.
 
-    Q = ViT 전체 토큰 (P3_raw), K/V = SOPM 상위 25% CNN 토큰.
-    2D sinusoidal PE를 Q/K에 각각 추가 (피어리뷰 M1 반영).
+    논문 식 (4), (5):
+    Q = ViT 전체 토큰, K/V = 소형 객체 히트맵 상위 25% CNN 토큰.
+    2D sinusoidal PE를 Q/K에 각각 추가.
 
     파라미터: ~0.5M (d_model=384 기준)
     """
@@ -313,7 +315,7 @@ class SelectiveCrossAttention(nn.Module):
         self,
         vit_feats: torch.Tensor,
         cnn_feats_2d: torch.Tensor,
-        sopm: torch.Tensor,
+        heatmap: torch.Tensor,
         h_vit: int,
         w_vit: int,
     ) -> torch.Tensor:
@@ -321,7 +323,7 @@ class SelectiveCrossAttention(nn.Module):
         Args:
             vit_feats: ViT 패치 토큰 [B, N_vit, vit_dim]. N_vit = h_vit * w_vit.
             cnn_feats_2d: CNN D3 특징맵 [B, 256, H_d3, W_d3].
-            sopm: SOPM [B, 1, H_d3, W_d3].
+            heatmap: 소형 객체 히트맵 S [B, 1, H_d3, W_d3].
             h_vit: ViT 패치 그리드 세로 크기.
             w_vit: ViT 패치 그리드 가로 크기.
 
@@ -332,9 +334,9 @@ class SelectiveCrossAttention(nn.Module):
         N_vit = vit_feats.shape[1]
 
         # --- Top-K 선택 ---
-        sopm_flat = sopm.reshape(B, H_d3 * W_d3)        # [B, N_cnn]
-        K = max(1, int(sopm_flat.shape[1] * self.topk_ratio))
-        _, topk_indices = sopm_flat.topk(K, dim=1)       # [B, K]
+        heatmap_flat = heatmap.reshape(B, H_d3 * W_d3)        # [B, N_cnn]
+        K = max(1, int(heatmap_flat.shape[1] * self.topk_ratio))
+        _, topk_indices = heatmap_flat.topk(K, dim=1)       # [B, K]
 
         # CNN 특징 flatten → Top-K 인덱싱
         cnn_flat = cnn_feats_2d.flatten(2).permute(0, 2, 1)  # [B, N_cnn, 256]
@@ -376,16 +378,16 @@ class SelectiveCrossAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SOPM FocalLoss (학습 전용)
+# Heatmap FocalLoss (학습 전용) - 논문 식 (2)
 # ---------------------------------------------------------------------------
 
-class SOPMFocalLoss(nn.Module):
-    """SOPM 감독용 FocalLoss.
+class HeatmapFocalLoss(nn.Module):
+    """소형 객체 히트맵 감독용 FocalLoss.
 
-    GT 소형 bbox 중심에 가우시안 히트맵을 생성하여 SOPM을 직접 감독.
+    GT 소형 bbox 중심에 가우시안 히트맵을 생성하여 히트맵 S를 직접 감독.
     추론 시 사용하지 않음 (비용 0%).
 
-    L_sopm = FocalLoss(SOPM, GT_heatmap, alpha=0.25, gamma=2.0)
+    논문 식 (2): L_heatmap = FocalLoss(S, GT_heatmap, alpha=0.25, gamma=2.0)
     """
 
     def __init__(
@@ -409,11 +411,11 @@ class SOPMFocalLoss(nn.Module):
         w: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """GT 소형 bbox 중심에 가우시안 히트맵 생성.
+        """GT 소형 bbox 중심에 가우시안 히트맵 생성. 논문 식 (3).
 
         Args:
             targets: 타겟 리스트. 각 dict에 'boxes' (cxcywh, normalized) 포함.
-            h: 히트맵 세로 크기 (= SOPM 해상도).
+            h: 히트맵 세로 크기.
             w: 히트맵 가로 크기.
             device: 텐서 디바이스.
 
@@ -432,24 +434,20 @@ class SOPMFocalLoss(nn.Module):
             if boxes.numel() == 0:
                 continue
 
-            # 면적 기반 소형 객체 필터링 (normalized → pixel 면적 추정)
-            # boxes는 [0,1] 정규화. 면적 = w_box * h_box * (img_w * img_h)
-            # 실제 이미지 크기 대신 SOPM 해상도 기준으로 필터링
-            bw = boxes[:, 2] * w  # SOPM 해상도 기준 너비
-            bh = boxes[:, 3] * h  # SOPM 해상도 기준 높이
-            areas_sopm = bw * bh  # SOPM 공간에서의 면적
+            bw = boxes[:, 2] * w
+            bh = boxes[:, 3] * h
+            areas_heatmap = bw * bh
 
-            # 원본 이미지 기준 area ≤ 1024에 대응하는 SOPM 면적 임계값
-            # stride-8 기준: sopm_area = orig_area / 64
-            sopm_threshold = self.small_area_threshold / 64.0
-            small_mask = areas_sopm <= sopm_threshold
+            # stride-8 기준: heatmap_area = orig_area / 64
+            heatmap_threshold = self.small_area_threshold / 64.0
+            small_mask = areas_heatmap <= heatmap_threshold
 
             if not small_mask.any():
                 continue
 
             small_boxes = boxes[small_mask]
-            cx = small_boxes[:, 0] * w  # SOPM x 좌표
-            cy = small_boxes[:, 1] * h  # SOPM y 좌표
+            cx = small_boxes[:, 0] * w
+            cy = small_boxes[:, 1] * h
 
             for i in range(cx.shape[0]):
                 gaussian = torch.exp(
@@ -462,22 +460,22 @@ class SOPMFocalLoss(nn.Module):
 
     def forward(
         self,
-        sopm: torch.Tensor,
+        heatmap: torch.Tensor,
         targets: List[dict],
     ) -> torch.Tensor:
         """
         Args:
-            sopm: SOPM 예측 [B, 1, H, W].
+            heatmap: 소형 객체 히트맵 예측 S [B, 1, H, W].
             targets: GT 타겟 리스트.
 
         Returns:
             FocalLoss 스칼라.
         """
-        _, _, h, w = sopm.shape
-        gt_heatmap = self.build_gt_heatmap(targets, h, w, sopm.device)
+        _, _, h, w = heatmap.shape
+        gt_heatmap = self.build_gt_heatmap(targets, h, w, heatmap.device)
 
         # Binary Focal Loss
-        pred = sopm.clamp(1e-6, 1.0 - 1e-6)
+        pred = heatmap.clamp(1e-6, 1.0 - 1e-6)
         bce = -(gt_heatmap * torch.log(pred) + (1 - gt_heatmap) * torch.log(1 - pred))
 
         # Focal 가중치
@@ -492,23 +490,24 @@ class SOPMFocalLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SCA 통합 모듈
+# SCA 통합 모듈 (Selective Cross-Attention)
 # ---------------------------------------------------------------------------
 
 class SCA(nn.Module):
     """Selective Cross-Attention.
 
     Backbone→Projector 간극에서 ViT 특징에 CNN 고해상도 정보를 선택적 융합.
-    소형 객체 히트맵 생성 후 Top-K 25% 선택적 교차 어텐션으로 ViT 특징 강화.
+    소형 객체 히트맵 S를 생성하여 상위 25% 토큰만 선택적으로 융합.
 
-    설계 근거:
-    - alpha=0.01 초기화: 피어리뷰 C1 반영, gradient cold start 방지.
-    - 2D sinusoidal PE: 피어리뷰 M1 반영, Q/K 해상도 차이 보정.
-    - Top-K 25%: 배치 처리 효율 + 배경 노이즈 차단.
-    - FocalLoss 직접 감독: SOPM 빠른 수렴 보장 (v5.0 이후).
+    논문 Section 3.1:
+    - CNN Branch: stride-8 고해상도 특징 추출
+    - DINOv2 Block4 어텐션 맵: 소형 객체 후보 사전지식
+    - 소형 객체 히트맵 S: 식 (1)
+    - Top-K 25% 선택적 교차 어텐션: 식 (4), (5)
+    - alpha=0.01 게이팅: gradient cold start 방지
 
     추론 비용: +1~3% (FocalLoss는 학습 전용).
-    파라미터: ~3.1M (CNN ~1.5M + SOPM ~0.1M + CrossAttn ~0.5M + alpha 1개).
+    파라미터: ~3.1M (CNN ~1.5M + Heatmap ~0.1M + CrossAttn ~0.5M + alpha 1개).
     """
 
     def __init__(
@@ -518,7 +517,7 @@ class SCA(nn.Module):
         num_heads: int = 6,
         topk_ratio: float = 0.25,
         alpha_init: float = 0.01,
-        sopm_loss_weight: float = 0.5,
+        heatmap_loss_weight: float = 0.5,
         use_attn_prior: bool = True,
     ) -> None:
         """
@@ -527,22 +526,21 @@ class SCA(nn.Module):
             cnn_channels: CNN Branch 출력 채널 수.
             num_heads: Cross-Attention head 수.
             topk_ratio: Top-K 선택 비율 (0.25 = 상위 25%).
-            alpha_init: 게이팅 파라미터 초기값 (피어리뷰: 0.01).
-            sopm_loss_weight: L_sopm 가중치 (λ_sopm).
-            use_attn_prior: ViT Attn Prior 사용 여부 (ablation C1 용).
+            alpha_init: 게이팅 파라미터 초기값 (0.01).
+            heatmap_loss_weight: L_heatmap 가중치 (λ_heatmap).
+            use_attn_prior: ViT Attn Prior 사용 여부.
         """
         super().__init__()
 
         self.use_attn_prior = use_attn_prior
-        self.sopm_loss_weight = sopm_loss_weight
+        self.heatmap_loss_weight = heatmap_loss_weight
 
         # 게이팅 파라미터: clamp(0, 1) 적용
-        # [v1.0.0] alpha=0.01 초기화 (피어리뷰 C1: cold start 방지)
         self.alpha = nn.Parameter(torch.tensor(alpha_init))
 
         # 서브 모듈
         self.cnn_branch = CNNBranch(in_channels=3, out_channels=cnn_channels)
-        self.sopm_head = SOPMHead(cnn_channels=cnn_channels)
+        self.heatmap_head = SmallObjectHeatmapHead(cnn_channels=cnn_channels)
         self.cross_attn = SelectiveCrossAttention(
             vit_dim=vit_dim,
             cnn_dim=cnn_channels,
@@ -550,7 +548,7 @@ class SCA(nn.Module):
             num_heads=num_heads,
             topk_ratio=topk_ratio,
         )
-        self.sopm_focal_loss = SOPMFocalLoss()
+        self.heatmap_focal_loss = HeatmapFocalLoss()
 
         # Attention Prior 추출기 (hook 기반)
         self.attn_extractor = AttentionPriorExtractor()
@@ -563,11 +561,6 @@ class SCA(nn.Module):
         Args:
             encoder: DINOv2 encoder 모듈.
             num_heads: ViT attention head 수.
-
-        실제 구조 (RF-DETR + HuggingFace DINOv2):
-            encoder.encoder.layer.3.attention.attention
-                -> Dinov2WithRegistersSdpaSelfAttention
-                -> .query (Linear), .key (Linear), .value (Linear)
         """
         attn_module = None
         candidates = [
@@ -592,7 +585,7 @@ class SCA(nn.Module):
         if attn_module is None:
             print(
                 "[SCA WARNING] DINOv2 Block4 attention module not found.\n"
-                "  Falling back to D3-only SOPM (no Attn Prior).\n"
+                "  Falling back to D3-only heatmap (no Attn Prior).\n"
                 "  Check encoder structure and update register_attn_hook()."
             )
             self.use_attn_prior = False
@@ -610,15 +603,14 @@ class SCA(nn.Module):
 
         Args:
             feats: DINOv2 encoder 출력. 4개 텐서 리스트 (out_feature_indexes=[3,6,9,12]).
-                   각 텐서: [B, N_patches, vit_dim] 또는 [B, N_patches+1, vit_dim] (CLS 포함).
             images: 원본 이미지 [B, 3, H, W].
-            targets: GT 타겟 (학습 시만 필요). None이면 SOPM loss 미계산.
+            targets: GT 타겟 (학습 시만 필요). None이면 heatmap loss 미계산.
 
         Returns:
-            (enriched_feats, sopm, loss_dict)
+            (enriched_feats, heatmap, loss_dict)
             - enriched_feats: 수정된 feats 리스트 (feats[0]만 변경).
-            - sopm: [B, 1, H_d3, W_d3] SOPM.
-            - loss_dict: {"loss_sopm": tensor} (학습 시) 또는 {} (추론 시).
+            - heatmap: [B, 1, H_d3, W_d3] 소형 객체 히트맵.
+            - loss_dict: {"loss_heatmap": tensor} (학습 시) 또는 {} (추론 시).
         """
         B = images.shape[0]
         loss_dict = {}
@@ -628,7 +620,6 @@ class SCA(nn.Module):
         _, C_vit, h_vit, w_vit = feat0.shape
 
         # 토큰 형식으로 변환 (Cross-Attention용)
-        # [B, C, H, W] -> [B, H*W, C]
         vit_patches = feat0.flatten(2).permute(0, 2, 1)  # [B, N_vit, C]
 
         # --- CNN Branch: 고해상도 특징 추출 ---
@@ -652,32 +643,32 @@ class SCA(nn.Module):
                     align_corners=False,
                 )
 
-        # --- SOPM 생성 ---
-        sopm = self.sopm_head(d3, attn_prior_2d)  # [B, 1, H_d3, W_d3]
+        # --- 소형 객체 히트맵 생성 ---
+        heatmap = self.heatmap_head(d3, attn_prior_2d)  # [B, 1, H_d3, W_d3]
 
-        # --- SOPM FocalLoss (학습 시) ---
+        # --- Heatmap FocalLoss (학습 시) ---
         if targets is not None and self.training:
-            loss_sopm = self.sopm_focal_loss(sopm, targets)
-            loss_dict["loss_sopm"] = loss_sopm * self.sopm_loss_weight
+            loss_heatmap = self.heatmap_focal_loss(heatmap, targets)
+            loss_dict["loss_heatmap"] = loss_heatmap * self.heatmap_loss_weight
 
         # --- Selective Cross-Attention ---
         alpha_clamped = self.alpha.clamp(0.0, 1.0)
         cross_attn_out = self.cross_attn(
             vit_feats=vit_patches,
             cnn_feats_2d=d3,
-            sopm=sopm,
+            heatmap=heatmap,
             h_vit=h_vit,
             w_vit=w_vit,
         )  # [B, N_vit, C]
 
-        # --- 게이팅 잔차 연결 ---
+        # --- 게이팅 잔차 연결: 식 (5) ---
         enriched_patches = vit_patches + alpha_clamped * cross_attn_out
 
-        # 공간 형식으로 복원: [B, N_vit, C] -> [B, C, H_vit, W_vit]
+        # 공간 형식으로 복원
         enriched_feat0 = enriched_patches.permute(0, 2, 1).reshape(B, C_vit, h_vit, w_vit)
 
         # --- feats 리스트 재구성 (feats[0]만 교체) ---
         enriched_feats = list(feats)  # shallow copy
         enriched_feats[0] = enriched_feat0
 
-        return enriched_feats, sopm, loss_dict
+        return enriched_feats, heatmap, loss_dict

@@ -37,7 +37,13 @@ from rfdetr.models.segmentation_head import (
     point_sample,
 )
 from rfdetr.models.transformer import build_transformer
+# SOD: SAQG (Small-object Aware Query Generator)
+from rfdetr.models.saqg import SAQG
+# SOD: SQALB (Scale-Quality Aware Loss Balancer)
+from rfdetr.models.sqalb import SQALB
 from rfdetr.util import box_ops
+# SOD: NWD Loss (Scale-Adaptive NWD/CIoU Loss)
+from rfdetr.models.nwd_loss import nwd_adaptive_loss
 from rfdetr.util.misc import (
     NestedTensor,
     accuracy,
@@ -88,6 +94,8 @@ class LWDETR(nn.Module):
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
         self.backbone = backbone
+        # SOD: SAQG (heatmap-based query rearrangement)
+        self.saqg = SAQG() if getattr(backbone[0], 'sca_enabled', False) else None
         self.aux_loss = aux_loss
         self.group_detr = group_detr
 
@@ -182,6 +190,12 @@ class LWDETR(nn.Module):
         if self.segmentation_head is not None:
             seg_head_fwd = self.segmentation_head.sparse_forward if self.training else self.segmentation_head.forward
 
+
+        # SOD: SAQG heatmap-based query rearrangement
+        if self.saqg is not None:
+            _sopm = self.backbone[0].sopm  # cached from SCA
+            _bs = srcs[0].shape[0]
+            refpoint_embed_weight = self.saqg(refpoint_embed_weight, _sopm, _bs)
 
         hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
             srcs, masks, poss, refpoint_embed_weight, query_feat_weight
@@ -388,6 +402,8 @@ class SetCriterion(nn.Module):
         self.sum_group_losses = sum_group_losses
         self.use_varifocal_loss = use_varifocal_loss
         self.use_position_supervised_loss = use_position_supervised_loss
+        # SOD: SQALB (Scale-Quality Aware Loss Balancer)
+        self.sqalb = None  # set externally after build
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
 
@@ -560,9 +576,31 @@ class SetCriterion(nn.Module):
         src_boxes = outputs["pred_boxes"][idx]
         target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
-        losses = {}
-        losses["loss_bbox"] = loss_bbox.sum() / num_boxes
+        # [v2.0.0] SQALB: adaptive NWD/WIoU balancing
+        if self.sqalb is not None and self.training:
+            # Get confidence from pred_logits if available
+            if "pred_logits" in outputs:
+                _logits = outputs["pred_logits"][idx]
+                _conf = _logits.sigmoid().max(dim=-1).values
+            else:
+                _conf = torch.zeros(src_boxes.shape[0], device=src_boxes.device)
+            # IoU quality
+            with torch.no_grad():
+                _iou = torch.diag(box_ops.generalized_box_iou(
+                    box_ops.box_cxcywh_to_xyxy(src_boxes.detach()),
+                    box_ops.box_cxcywh_to_xyxy(target_boxes),
+                )).clamp(0, 1)
+            # layer_idx from aux loss counter (default 0)
+            _layer_idx = getattr(self, "_current_layer_idx", 0)
+            loss_sqalb, _alpha_mean = self.sqalb(
+                src_boxes, target_boxes, _conf, _iou, _layer_idx
+            )
+            losses = {}
+            losses["loss_bbox"] = loss_sqalb.sum() / num_boxes
+        else:
+            loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+            losses = {}
+            losses["loss_bbox"] = loss_bbox.sum() / num_boxes
 
         loss_giou = 1 - torch.diag(
             box_ops.generalized_box_iou(
@@ -961,13 +999,14 @@ def build_model(args):
         patch_size=args.patch_size,
         num_windows=args.num_windows,
         positional_encoding_size=args.positional_encoding_size,
-        # SOD-DETR SCA
+        # SOD: SCA (Selective Cross-Attention)
         sca_enabled=getattr(args, "sca_enabled", False),
+        tfcm_enabled=getattr(args, "tfcm_enabled", False),
         sca_vit_dim=getattr(args, "sca_vit_dim", 384),
         sca_num_heads=getattr(args, "sca_num_heads", 6),
         sca_topk_ratio=getattr(args, "sca_topk_ratio", 0.25),
         sca_alpha_init=getattr(args, "sca_alpha_init", 0.01),
-        sca_sopm_loss_weight=getattr(args, "sca_sopm_loss_weight", 0.5),
+        sca_heatmap_loss_weight=getattr(args, "sca_heatmap_loss_weight", 0.5),
         sca_use_attn_prior=getattr(args, "sca_use_attn_prior", True),
     )
     if args.encoder_only:
@@ -1054,5 +1093,15 @@ def build_criterion_and_postprocessors(args):
         )
     criterion.to(device)
     postprocess = PostProcess(num_select=args.num_select)
+
+
+    # SOD: SQALB (Scale-Quality Aware Loss Balancer)
+    if getattr(args, "sca_enabled", False):
+        criterion.sqalb = SQALB(num_decoder_layers=args.dec_layers, resolution=getattr(args, "resolution", 576))
+
+    # SOD: NWD Loss config wiring
+    criterion._nwd_loss_enabled = getattr(args, 'nwd_loss_enabled', False)
+    criterion._nwd_loss_threshold = getattr(args, 'nwd_loss_threshold', 0.0024)
+    criterion._nwd_loss_C = getattr(args, 'nwd_loss_C', 0.5)
 
     return criterion, postprocess
