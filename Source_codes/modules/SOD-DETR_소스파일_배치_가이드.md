@@ -39,10 +39,6 @@ RF-DETR 원본에 존재하지 않는 파일이다.
 | `sca.py` | SCA 전체 (CNN Branch + 소형 객체 히트맵 + Top-K + Cross-Attention) |
 | `nwd.py` | NWD pairwise 거리 계산 (논문 식 (7)~(10)) |
 
-### 수정 없음
-
-`__init__.py`, `transformer.py`, `position_encoding.py`, `segmentation_head.py`, `backbone/`, `ops/`는 원본 그대로 사용한다.
-
 ## 모듈 설명
 
 ### SCA (Selective Cross-Attention) - 논문 Section 3.1
